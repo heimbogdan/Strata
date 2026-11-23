@@ -73,11 +73,13 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
 });
 
 let tab = "chat";
+const TABS = ["chat", "images", "images-edit", "monitor", "about"];
 function showTab(name) {
-  tab = ["chat", "images", "monitor", "about"].includes(name) ? name : "chat";
+  tab = TABS.includes(name) ? name : "chat";
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
-  for (const v of ["chat", "images", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
+  for (const v of TABS) $(`view-${v}`).hidden = v !== tab;
   if (tab === "images") $("img-prompt").focus();
+  if (tab === "images-edit") $("imge-prompt").focus();
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
   if (tab === "monitor") loadMcp();
@@ -119,7 +121,8 @@ async function loadHealth() {
     health = await (await fetch("health")).json();
     renderEmptyChat();
     $("tab-btn-images").hidden = !health.image_generation;
-    if (location.hash === "#images" && health.image_generation) showTab("images");
+    $("tab-btn-images-edit").hidden = !health.image_generation;
+    if ((location.hash === "#images" || location.hash === "#images-edit") && health.image_generation) showTab(location.hash.slice(1));
   } catch (e) {
     setTimeout(loadHealth, 2000);
   }
@@ -226,6 +229,7 @@ window.addEventListener("resize", fitHeader);
 // modelOp covers the button's own POST, which returns before the next poll can agree.
 let modelOp = null;
 let imageBusy = false;
+let imgePreviewUrl = null;
 function pageBusy() { return busy != null || imageBusy; }
 // "generating an image" is the job a refresh can see. imageBusy is this page's POST before that phase is published. A chat
 // phase already on the metrics wins, because Stop still stops that reply.
@@ -1624,6 +1628,62 @@ $("img-form").onsubmit = async (ev) => {
   } finally {
     imageBusy = false;
     $("img-go").disabled = false;
+    paintLive();
+  }
+};
+
+// ------------------------------------------------------------------ image edit (POST /v1/images/edits)
+$("imge-file").onchange = () => {
+  const f = $("imge-file").files[0];
+  const prev = $("imge-preview");
+  if (imgePreviewUrl) { URL.revokeObjectURL(imgePreviewUrl); imgePreviewUrl = null; }
+  if (!f) { prev.hidden = true; prev.removeAttribute("src"); return; }
+  imgePreviewUrl = URL.createObjectURL(f);
+  prev.src = imgePreviewUrl;
+  prev.hidden = false;
+};
+$("imge-form").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const file = $("imge-file").files[0];
+  const prompt = $("imge-prompt").value.trim();
+  if (!file || !prompt) return;
+  const form = new FormData();
+  form.append("image", file);
+  form.append("prompt", prompt);
+  form.append("size", $("imge-size").value);
+  form.append("response_format", "b64_json");
+  if ($("imge-seed").value !== "") form.append("seed", $("imge-seed").value);
+  const strength = $("imge-strength").value;
+  if (strength !== "") form.append("strength", strength);
+  imageBusy = true;
+  $("imge-go").disabled = true;
+  paintLive();
+  const t0 = performance.now();
+  $("imge-hint").textContent = "Editing\u2026 (a minute or more on a small GPU)";
+  try {
+    const r = await fetch("v1/images/edits", {method: "POST", headers: headers(false), body: form});
+    const j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
+    const capStrength = (j.strata && j.strata.strength != null)
+      ? j.strata.strength
+      : (strength !== "" ? strength : 0.75);
+    for (const d of j.data) {
+      const fig = document.createElement("figure");
+      const img = document.createElement("img");
+      img.src = "data:image/png;base64," + d.b64_json;
+      img.alt = prompt;
+      const cap = document.createElement("figcaption");
+      cap.textContent = `${j.size}, seed ${d.seed}, strength ${capStrength}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
+      fig.append(img, cap);
+      $("imge-results").prepend(fig);
+    }
+    $("imge-hint").textContent = "Done. Right-click an image to save it.";
+  } catch (e) {
+    $("imge-hint").textContent = "";
+    toast("error", "No image", String(e.message || e), 8000);
+  } finally {
+    imageBusy = false;
+    $("imge-go").disabled = false;
     paintLive();
   }
 };

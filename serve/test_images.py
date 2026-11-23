@@ -67,6 +67,123 @@ class Request(unittest.TestCase):
                 images_api.parse_request(req, self.CFG)
 
 
+class EditRequest(unittest.TestCase):
+    CFG = {"max_n": 4, "max_side": 2048}
+
+    def test_defaults_include_strength(self):
+        j = images_api.parse_edit_request({"prompt": "a cat"}, self.CFG)
+        self.assertEqual(j["strength"], 0.75)
+        self.assertEqual((j["width"], j["height"], j["n"], j["steps"]), (1024, 1024, 1, 8))
+
+    def test_strength_ok_and_refused(self):
+        self.assertEqual(images_api.parse_edit_request({"prompt": "x", "strength": 0.4}, self.CFG)["strength"], 0.4)
+        self.assertEqual(images_api.parse_edit_request({"prompt": "x", "strength": 0}, self.CFG)["strength"], 0.0)
+        self.assertEqual(images_api.parse_edit_request({"prompt": "x", "strength": 1}, self.CFG)["strength"], 1.0)
+        for bad in (True, "0.5", -0.1, 1.1, 2):
+            with self.subTest(bad=bad), self.assertRaises(images_api.ImageRequestError):
+                images_api.parse_edit_request({"prompt": "x", "strength": bad}, self.CFG)
+
+
+class EditImageDecode(unittest.TestCase):
+    def test_data_url_png(self):
+        raw = b"\x89PNG\r\n\x1a\n" + b"xxxx"
+        url = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+        data, suffix = images_api.decode_edit_image({"images": [{"image_url": url}], "prompt": "x"})
+        self.assertEqual(data, raw)
+        self.assertEqual(suffix, ".png")
+
+    def test_refuses_remote_url_and_empty(self):
+        with self.assertRaises(images_api.ImageRequestError):
+            images_api.decode_edit_image({"images": [{"image_url": "https://example.com/a.png"}], "prompt": "x"})
+        with self.assertRaises(images_api.ImageRequestError):
+            images_api.decode_edit_image({"prompt": "x"})
+        with self.assertRaises(images_api.ImageRequestError):
+            images_api.decode_edit_image({"images": [{"image_url": "data:image/png;base64,!!!!"}], "prompt": "x"})
+
+    def test_refuses_svg_data_url(self):
+        raw = b"<svg xmlns='http://www.w3.org/2000/svg'/>"
+        b64 = base64.b64encode(raw).decode("ascii")
+        for mediatype in ("image/svg+xml", "image/svg"):
+            with self.subTest(mediatype=mediatype):
+                url = f"data:{mediatype};base64,{b64}"
+                with self.assertRaises(images_api.ImageRequestError) as cm:
+                    images_api.decode_data_url(url)
+                self.assertIn("SVG", str(cm.exception))
+                with self.assertRaises(images_api.ImageRequestError) as cm:
+                    images_api.decode_edit_image({"images": [{"image_url": url}], "prompt": "x"})
+                self.assertIn("SVG", str(cm.exception))
+
+    def test_refuses_file_id(self):
+        url = "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\n").decode("ascii")
+        with self.assertRaises(images_api.ImageRequestError) as cm:
+            images_api.decode_edit_image({"images": [{"file_id": "file-abc", "image_url": url}], "prompt": "x"})
+        self.assertIn("file_id", str(cm.exception))
+
+    def test_multipart_roundtrip(self):
+        boundary = "----strataedit"
+        png = b"\x89PNG\r\n\x1a\n" + b"abcd"
+        def part(name, value, filename=None, ctype="application/octet-stream"):
+            disp = f'form-data; name="{name}"'
+            if filename:
+                disp += f'; filename="{filename}"'
+            head = f"--{boundary}\r\nContent-Disposition: {disp}\r\n"
+            if filename:
+                head += f"Content-Type: {ctype}\r\n"
+            head += "\r\n"
+            if isinstance(value, str):
+                value = value.encode()
+            return head.encode() + value + b"\r\n"
+        body = (part("prompt", "make it blue") + part("strength", "0.4")
+                + part("image", png, filename="in.png", ctype="image/png")
+                + f"--{boundary}--\r\n".encode())
+        req = images_api.parse_multipart_edits(body, f"multipart/form-data; boundary={boundary}")
+        self.assertEqual(req["prompt"], "make it blue")
+        self.assertEqual(req["strength"], "0.4")
+        self.assertEqual(req["image_bytes"], png)
+        self.assertEqual(req["image_suffix"], ".png")
+
+    def test_coerce_edit_form(self):
+        fields = {"prompt": "x", "strength": "0.4", "seed": "7", "image_bytes": b"\x89PNG", "image_suffix": ".png"}
+        job = images_api.coerce_edit_form(fields, {"max_n": 4, "max_side": 2048})
+        self.assertEqual(job["strength"], 0.4)
+        self.assertEqual(job["seed"], 7)
+        self.assertEqual(job["image_bytes"], b"\x89PNG")
+        self.assertEqual(job["image_suffix"], ".png")
+
+
+class EditRun(unittest.TestCase):
+    def test_run_writes_init_and_records_strength(self):
+        with tempfile.TemporaryDirectory() as d:
+            gen = images_api.ImageGen(image_cfg(d))
+            args_path = Path(d) / "args.json"
+            job = images_api.parse_edit_request({"prompt": "x", "seed": 1, "size": "512x512", "strength": 0.4},
+                                                  {"max_n": 4, "max_side": 2048})
+            job["image_bytes"] = b"\x89PNG\r\n\x1a\nxx"
+            job["image_suffix"] = ".png"
+            with mock.patch.dict(os.environ, {"FAKE_SD_ARGS": str(args_path)}):
+                with mock.patch.object(images_api, "sd_cli_args", fake_args):
+                    images, figures = gen.run(job)
+            self.assertEqual(figures["strength"], 0.4)
+            argv = json.loads(args_path.read_text(encoding="utf-8"))
+            self.assertIn("--init-img", argv)
+            self.assertEqual(argv[argv.index("--strength") + 1], "0.4")
+            self.assertEqual(len(images), 1)
+            self.assertEqual(list(Path(gen.dir).glob("job-*")), [])   # work dir cleaned up
+
+
+class EditCommand(unittest.TestCase):
+    def test_init_img_and_strength_on_command(self):
+        cfg = {"exe": "sd-cli", "diffusion_model": "d", "vae": "v", "llm": "l", "args": ["--diffusion-fa"]}
+        job = {"prompt": "p", "width": 512, "height": 512, "n": 1, "steps": 8, "seed": 1,
+               "strength": 0.4, "init_img": "work/init.png"}
+        cmd = images_api.sd_cli_args(cfg, job, "x", "p.txt")
+        self.assertEqual(cmd[cmd.index("--init-img") + 1], "work/init.png")
+        self.assertEqual(cmd[cmd.index("--strength") + 1], "0.4")
+        # generations (no init_img) unchanged:
+        job2 = {k: v for k, v in job.items() if k not in ("init_img", "strength")}
+        self.assertNotIn("--init-img", images_api.sd_cli_args(cfg, job2, "x", "p.txt"))
+
+
 class Command(unittest.TestCase):
     def test_the_model_cards_command(self):
         """Unsloth's stable-diffusion.cpp command for Turbo: 8 steps, CFG 1, euler, the Turbo sigmas, --diffusion-fa."""
@@ -584,6 +701,78 @@ class OverHttp(unittest.TestCase):
         (code, _), img_at = done["img"]
         self.assertEqual(code, 200)
         self.assertGreaterEqual(chat_at, img_at - 0.05)
+
+    def post_edits(self, body, is_multipart=False, boundary="----strataedit", headers=None):
+        if is_multipart:
+            data = body
+            content_type = f"multipart/form-data; boundary={boundary}"
+        elif isinstance(body, dict):
+            data = json.dumps(body).encode()
+            content_type = "application/json"
+        else:
+            data = body
+            content_type = "application/json"
+        
+        hdrs = {"Content-Type": content_type}
+        if headers:
+            hdrs.update(headers)
+            
+        req = urllib.request.Request(self.base + "/v1/images/edits", data=data, headers=hdrs)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def test_edits_json(self):
+        raw = b"\x89PNG\r\n\x1a\n" + b"xxxx"
+        url = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+        code, body = self.post_edits({
+            "prompt": "a green cat",
+            "seed": 11,
+            "images": [{"image_url": url}],
+            "strength": 0.5,
+        })
+        self.assertEqual(code, 200, body)
+        self.assertEqual(len(body["data"]), 1)
+        self.assertEqual(body["strata"]["steps"], 8)
+        self.assertEqual(body["strata"]["strength"], 0.5)
+
+    def test_edits_multipart(self):
+        boundary = "----strataedit"
+        png = b"\x89PNG\r\n\x1a\n" + b"abcd"
+        def part(name, value, filename=None, ctype="application/octet-stream"):
+            disp = f'form-data; name="{name}"'
+            if filename:
+                disp += f'; filename="{filename}"'
+            head = f"--{boundary}\r\nContent-Disposition: {disp}\r\n"
+            if filename:
+                head += f"Content-Type: {ctype}\r\n"
+            head += "\r\n"
+            if isinstance(value, str):
+                value = value.encode()
+            return head.encode() + value + b"\r\n"
+        
+        body = (part("prompt", "make it blue") + part("strength", "0.4")
+                + part("image", png, filename="in.png", ctype="image/png")
+                + f"--{boundary}--\r\n".encode())
+        
+        code, body = self.post_edits(body, is_multipart=True, boundary=boundary)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(len(body["data"]), 1)
+        self.assertEqual(body["strata"]["strength"], 0.4)
+
+    def test_edits_not_set_up(self):
+        self.svc.images = None
+        code, body = self.post_edits({"prompt": "x"})
+        self.assertEqual(code, 404)
+        self.assertEqual(body["error"]["code"], "images_not_set_up")
+
+    def test_edits_missing_image_400(self):
+        code, body = self.post_edits({"prompt": "x"})
+        self.assertEqual(code, 400)
+        self.assertIn("error", body)
 
 
 class VaeDecoderSwitch(unittest.TestCase):

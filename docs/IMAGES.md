@@ -87,6 +87,57 @@ Turbo's own sigmas, `--diffusion-fa`. The model can leave parts of a picture tra
 white and returns an 8-bit RGB PNG, with the PNG's text chunk (prompt and settings) unchanged. With
 `"background": "transparent"` you get the PNG exactly as plain `sd-cli` writes it, transparent areas included.
 
+## Image edits
+
+Classic image-to-image uses the same setup and GPU rules as generations. Send a source picture and a prompt to
+`POST /v1/images/edits`. The server writes the picture into the job folder, runs `sd-cli` with `--init-img` and
+`--strength`, and returns the same response shape as generations.
+
+This route does **not** do masks, instruction edit, or ComfyUI. Those are planned separately.
+
+### Edit fields
+
+| Field | Meaning |
+| --- | --- |
+| `image` | The source file (multipart only). PNG, JPEG, or WebP. |
+| `prompt` | What to change or add (required). Same limits as generations. |
+| `strength` | Strata's: how much noise to add before denoising, from `0` to `1`. Default: **0.75**. Lower values stay closer to the source; higher values follow the prompt more. |
+| `size`, `n`, `response_format`, `background`, `seed`, `steps` | Same as [Request fields](#request-fields) above. |
+
+In JSON, put the source in OpenAI's edits shape instead of `image`:
+
+| Field | Meaning |
+| --- | --- |
+| `images` | A list with **one** object: `{ "image_url": "data:image/png;base64,..." }`. Only **data URLs** are accepted (no `https://` fetch, no `file_id`). PNG, JPEG, or WebP. |
+
+The answer matches generations, and `strata.strength` reports the strength used on the job.
+
+### Examples
+
+Multipart (typical for scripts and the web page):
+
+```sh
+curl http://127.0.0.1:8080/v1/images/edits \
+  -F "image=@photo.png" \
+  -F "prompt=a watercolor version of this scene" \
+  -F "strength=0.6" \
+  -F "size=1024x1024"
+```
+
+JSON with a data URL (handy when the picture is already in memory):
+
+```sh
+curl http://127.0.0.1:8080/v1/images/edits -H "Content-Type: application/json" \
+  -d '{"images":[{"image_url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="}],
+       "prompt":"turn the sky orange at sunset","strength":0.75,"size":"1024x1024"}'
+```
+
+### Web UI
+
+When image generation is set up, the server page shows an **Image edit** tab next to **Images**. Upload a file, describe
+the change, set size and seed if you want, and adjust **Strength** (default 0.75). The page sends multipart to
+`POST /v1/images/edits`.
+
 ## Sharing the GPU with the text model
 
 One job runs at a time. An image job takes the same turn a chat request takes, so a chat request waits for the image

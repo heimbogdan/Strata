@@ -1,6 +1,6 @@
 """serve/images.py - image generation (Qwen-Image-2.1-Turbo) through stable-diffusion.cpp's sd-cli.
 
-POST /v1/images/generations takes OpenAI's request shape (prompt, size, n, response_format b64_json|url, background)
+POST /v1/images/generations and POST /v1/images/edits take OpenAI's request shape (prompt, size, n, response_format b64_json|url, background, strength for edits)
 plus Strata's own fields seed and steps.  Each request runs one `sd-cli` process with the arguments the model's card
 gives for stable-diffusion.cpp (8 steps, CFG 1, euler, Turbo's sigmas, --diffusion-fa).  The model writes RGBA; by
 default each picture is put on white and returned as an 8-bit RGB PNG with sd-cli's other chunks (its "parameters"
@@ -32,6 +32,7 @@ The config's "images" section (written by setup --images, tools/image/install.py
 from __future__ import annotations
 
 import base64
+import binascii
 import contextlib
 import json
 import os
@@ -42,6 +43,8 @@ import subprocess
 import tempfile
 import threading
 import time
+from email import policy
+from email.parser import BytesParser
 from pathlib import Path
 
 from strata_control.childenv import quiet_crash_env
@@ -68,6 +71,11 @@ VAE_BACKEND = ("Image generation is set to use Strata's own picture decoder (\"v
                "for {backend}. Set \"vae_decoder\" to \"sdcpp\" in the images settings.")   # {backend}: as setup prints it
 SIZE_STEP = 32                     # sd.cpp's Qwen-Image-2.1 docs: dimensions divisible by 32
 MIN_SIDE = 256
+DEFAULT_STRENGTH = 0.75
+# Cap decoded edit images (~MCP media); independent of HTTP body_limit().
+MAX_EDIT_IMAGE_BYTES = 25_000_000
+_EDIT_IMAGE_TYPES = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/webp": ".webp"}
+_EDIT_FORM_NUMERIC = ("strength", "n", "seed", "steps")
 FILE_NAME = re.compile(r"^[0-9a-f]{32}\.png$")
 STEP_LINE = re.compile(r"\|\s*(\d+)/(\d+)\s*-")      # sd.cpp's progress bar: "|====    | 3/8 - 14.1s/it"
 
@@ -136,6 +144,123 @@ def parse_request(req: dict, cfg: dict) -> dict:
             "background": background}
 
 
+def parse_strength(value) -> float:
+    if value is None:
+        return DEFAULT_STRENGTH
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not (0.0 <= float(value) <= 1.0):
+        raise ImageRequestError("strength: a number from 0 to 1")
+    return float(value)
+
+
+def parse_edit_request(req: dict, cfg: dict) -> dict:
+    job = parse_request(req, cfg)
+    job["strength"] = parse_strength(req.get("strength"))
+    return job
+
+
+def decode_data_url(url: str) -> tuple[bytes, str]:
+    """A data:image/...;base64,... URL -> (raw bytes, file suffix).  Remote https:// URLs are refused."""
+    if not isinstance(url, str) or not url.startswith("data:"):
+        raise ImageRequestError("image_url: a data URL (data:image/...;base64,...)")
+    try:
+        header, data = url[5:].split(",", 1)
+    except ValueError as e:
+        raise ImageRequestError("image_url: malformed data URL") from e
+    if ";base64" not in header.lower():
+        raise ImageRequestError("image_url: base64 data URL required")
+    mediatype = header.split(";", 1)[0].lower().strip() or "text/plain"
+    if mediatype in ("image/svg+xml", "image/svg"):
+        raise ImageRequestError("image: SVG is not supported")
+    suffix = _EDIT_IMAGE_TYPES.get(mediatype)
+    if suffix is None:
+        raise ImageRequestError(f"image: unsupported type {mediatype!r}")
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise ImageRequestError("image_url: invalid base64") from e
+    if not raw:
+        raise ImageRequestError("image: empty body")
+    if len(raw) > MAX_EDIT_IMAGE_BYTES:
+        raise ImageRequestError("image: too large")
+    return raw, suffix
+
+
+def decode_edit_image(req: dict) -> tuple[bytes, str]:
+    images = req.get("images")
+    if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict):
+        raise ImageRequestError("images: exactly one object with image_url (data URL)")
+    if images[0].get("file_id"):
+        raise ImageRequestError("file_id is not supported")
+    url = images[0].get("image_url")
+    if not isinstance(url, str):
+        raise ImageRequestError("images: exactly one object with image_url (data URL)")
+    return decode_data_url(url)
+
+
+def parse_multipart_edits(body: bytes, content_type: str) -> dict:
+    """multipart/form-data edit upload -> form fields (strings) plus image_bytes and image_suffix."""
+    if not re.search(r"boundary\s*=", content_type, re.I):
+        raise ImageRequestError("multipart: missing boundary")
+    msg = BytesParser(policy=policy.default).parsebytes(
+        f"Content-Type: {content_type}\r\n\r\n".encode("ascii", errors="replace") + body)
+    out: dict = {}
+    image_bytes = None
+    image_suffix = None
+    for part in msg.iter_parts():
+        cd = part.get("Content-Disposition", "")
+        name_m = re.search(r'name="([^"]+)"', cd)
+        if not name_m:
+            continue
+        name = name_m.group(1)
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            payload = b""
+        ctype = (part.get_content_type() or "").lower()
+        if re.search(r'filename\s*=', cd, re.I) or ctype.startswith("image/"):
+            if image_bytes is not None:
+                raise ImageRequestError("image: only one image field allowed")
+            if ctype in ("image/svg+xml", "image/svg"):
+                raise ImageRequestError("image: SVG is not supported")
+            image_suffix = _EDIT_IMAGE_TYPES.get(ctype)
+            if image_suffix is None:
+                fn_m = re.search(r'filename="([^"]*)"', cd, re.I)
+                ext = Path(fn_m.group(1)).suffix.lower() if fn_m else ""
+                if ext == ".jpeg":
+                    ext = ".jpg"
+                if ext in (".png", ".jpg", ".webp"):
+                    image_suffix = ext
+            if image_suffix is None:
+                raise ImageRequestError(f"image: unsupported type {ctype!r}")
+            if not payload:
+                raise ImageRequestError("image: empty body")
+            if len(payload) > MAX_EDIT_IMAGE_BYTES:
+                raise ImageRequestError("image: too large")
+            image_bytes = payload
+        else:
+            out[name] = payload.decode("utf-8", errors="replace")
+    if image_bytes is None:
+        raise ImageRequestError("image: required")
+    out["image_bytes"] = image_bytes
+    out["image_suffix"] = image_suffix
+    return out
+
+
+def coerce_edit_form(fields: dict, cfg: dict) -> dict:
+    """Multipart form strings -> parse_edit_request, keeping image_bytes / image_suffix aside."""
+    image_bytes = fields.get("image_bytes")
+    image_suffix = fields.get("image_suffix")
+    req = {k: v for k, v in fields.items() if k not in ("image_bytes", "image_suffix")}
+    for key in _EDIT_FORM_NUMERIC:
+        if key in req and isinstance(req[key], str):
+            req[key] = float(req[key]) if key == "strength" else int(req[key])
+    job = parse_edit_request(req, cfg)
+    if image_bytes is not None:
+        job["image_bytes"] = image_bytes
+    if image_suffix is not None:
+        job["image_suffix"] = image_suffix
+    return job
+
+
 def write_prompt(work: Path, prompt: str) -> Path:
     """The job's prompt as a file for sd-cli's --prompt-file, readable by this user only (#4202).  Not on the command line:
     every local account can read a process's arguments (ps, /proc/<pid>/cmdline).  Written as UTF-8 without newline
@@ -143,6 +268,15 @@ def write_prompt(work: Path, prompt: str) -> Path:
     path = work / "prompt.txt"
     with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8", newline="") as f:
         f.write(prompt)
+    return path
+
+
+def write_init_image(work: Path, data: bytes, suffix: str = ".png") -> Path:
+    if suffix not in (".png", ".jpg", ".jpeg", ".webp"):
+        suffix = ".png"
+    path = work / f"init{suffix}"
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as f:
+        f.write(data)
     return path
 
 
@@ -160,6 +294,8 @@ def sd_cli_args(cfg: dict, job: dict, out_pattern: str, prompt_file: str) -> lis
     cmd += ["-s", str(job["seed"])]
     if job["n"] > 1:
         cmd += ["-b", str(job["n"])]
+    if job.get("init_img"):
+        cmd += ["--init-img", str(job["init_img"]), "--strength", str(job.get("strength", DEFAULT_STRENGTH))]
     cmd += ["-o", out_pattern]
     cmd += [str(a) for a in (cfg.get("args") or [])]
     model_args = []
@@ -447,7 +583,12 @@ class ImageGen:
             raise ImageJobFailed(problem)
         work = Path(tempfile.mkdtemp(prefix="job-", dir=self.dir))
         pattern = str(work / "img_%d.png")
+        orig_job = job
+        job = dict(job)
         try:
+            if job.get("image_bytes"):
+                init_path = write_init_image(work, job["image_bytes"], job.get("image_suffix") or ".png")
+                job["init_img"] = str(init_path)
             cmd = sd_cli_args(self.cfg, job, pattern, str(write_prompt(work, job["prompt"])))
         except BaseException:                       # the prompt file was not made: nothing else is in the folder yet
             for p in work.iterdir():
@@ -513,12 +654,14 @@ class ImageGen:
         figures = {"seconds": round(secs, 2), "steps": job["steps"], "n": job["n"],
                    "size": f"{job['width']}x{job['height']}", "seed": job["seed"],
                    "backend": self.cfg.get("backend"), "quant": self.cfg.get("quant")}
+        if "strength" in job:
+            figures["strength"] = job["strength"]
         figures.update(log_figures(log))
         if job.get("background", "auto") != "transparent":
             t1 = time.monotonic()
             flat = [self._flatten(png) for png in images]
             images = [png for png, _ in flat]
-            job["alpha_kept"] = any(kept for _, kept in flat)     # a picture went out with its alpha after all
+            orig_job["alpha_kept"] = job["alpha_kept"] = any(kept for _, kept in flat)     # a picture went out with its alpha after all
             figures["flatten_s"] = round(time.monotonic() - t1, 3)
         self.totals["jobs"] += 1
         self.totals["images"] += job["n"]

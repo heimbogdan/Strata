@@ -25,6 +25,8 @@
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg><span data-i18n="tab.chat">Chat</span></button>
     <button class="st-tab" role="tab" id="tab-btn-images" aria-controls="view-images" aria-selected="false" data-tab="images" hidden>
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg><span data-i18n="tab.images">Images</span></button>
+    <button class="st-tab" role="tab" id="tab-btn-images-edit" aria-controls="view-images-edit" aria-selected="false" data-tab="images-edit" hidden>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-edit"/></svg><span>Image edit</span></button>
     <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg><span data-i18n="tab.monitor">Monitor</span></button>
     <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about">
@@ -110,6 +112,32 @@
         <span class="composer-hint" id="img-hint">One image at a time; a chat request waits for it (and the other way round).</span>
       </form>
       <div class="img-results" id="img-results"></div>
+    </div>
+  </section>
+
+  <!-- ============================ Image edit ============================ -->
+  <section class="view view--images" id="view-images-edit" role="tabpanel" aria-labelledby="tab-btn-images-edit" hidden>
+    <div class="about">
+      <form class="st-card img-form" id="imge-form">
+        <span class="card-title">Edit an image</span>
+        <label class="st-field">Source image
+          <input class="st-input" id="imge-file" type="file" accept="image/png,image/jpeg,image/webp" required></label>
+        <img class="imge-preview" id="imge-preview" alt="" hidden>
+        <textarea class="st-input img-prompt" id="imge-prompt" rows="3" placeholder="Describe the change&hellip;" aria-label="Prompt" required></textarea>
+        <div class="img-row">
+          <label class="st-field">Size
+            <select class="st-input" id="imge-size">
+              <option>1024x1024</option><option>1536x1024</option><option>1024x1536</option>
+              <option>768x768</option><option>512x512</option></select></label>
+          <label class="st-field">Seed
+            <input class="st-input" id="imge-seed" type="number" min="0" placeholder="random"></label>
+          <label class="st-field">Strength
+            <input class="st-input" id="imge-strength" type="number" min="0" max="1" step="0.05" value="0.75"></label>
+          <button type="submit" class="st-btn st-btn--primary" id="imge-go">Edit</button>
+        </div>
+        <span class="composer-hint" id="imge-hint">One image at a time; a chat request waits for it (and the other way round).</span>
+      </form>
+      <div class="img-results" id="imge-results"></div>
     </div>
   </section>
 

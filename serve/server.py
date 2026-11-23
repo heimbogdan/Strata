@@ -5,8 +5,7 @@
 
 Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
 non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time behind a FIFO (plan: one resident sequence).
-Image generation (optional, when the config has an "images" section): POST /v1/images/generations (OpenAI's shape,
-plus seed and steps) runs stable-diffusion.cpp's sd-cli for Qwen-Image-2.1-Turbo, one job at a time on the GPU the
+Image generation and editing (optional, when the config has an "images" section): POST /v1/images/generations and POST /v1/images/edits (OpenAI's shape, plus seed, steps and strength) runs stable-diffusion.cpp's sd-cli for Qwen-Image-2.1-Turbo, one job at a time on the GPU the
 text engine uses (serve/images.py).
 Tools from MCP servers (serve/mcp.py, `"mcp_servers"` in the config or --mcp-config) are offered only to requests that
 ask for them with `"strata_mcp": true` - the web app does; other clients see exactly the API they always saw.
@@ -7697,7 +7696,7 @@ def make_handler(svc: Service):
                              f"turns this check off"}})
             return False
 
-        def _foreign_page(self) -> bool:
+        def _foreign_page(self, path="") -> bool:
             """Without an API key, a /v1 POST from a browser page of another site (any site can POST text/plain
             there without a CORS preflight) would burn GPU time: an Origin header must name an allowed page, and
             then the body must be JSON.  No Origin (curl, the SDKs, other servers): any content type, as before."""
@@ -7713,10 +7712,13 @@ def make_handler(svc: Service):
                                  f"or add the page's host to \"allowed_hosts\" (or its origin to \"cors_origins\") "
                                  f"in the config"}})
                 return True
-            if not self.headers.get("Content-Type", "").startswith("application/json"):
-                self._json(415, {"error": {"message": "send application/json"}})
-                return True
-            return False
+            ctype = self.headers.get("Content-Type", "")
+            if ctype.startswith("application/json"):
+                return False
+            if path == "/v1/images/edits" and ctype.startswith("multipart/form-data"):
+                return False
+            self._json(415, {"error": {"message": "send application/json"}})
+            return True
 
         def end_headers(self):
             # HTTP/1.0 without keep-alive: the server closes the connection after every response.  Say so, or a
@@ -8223,7 +8225,7 @@ def make_handler(svc: Service):
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             path = V1_V1_ALIASES.get(path, path)         # an Anthropic client given ".../v1" as its base posts /v1/v1/messages
-            if path.startswith("/v1/") and self._foreign_page():
+            if path.startswith("/v1/") and self._foreign_page(path):
                 return
             if path == "/settings":
                 self._settings()
@@ -8260,6 +8262,9 @@ def make_handler(svc: Service):
                 return
             reserved = False
             try:
+                if path == "/v1/images/edits":
+                    self._images_edits()
+                    return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     reserved = svc.reserve_inference()
                     if reserved is None:
@@ -8429,6 +8434,53 @@ def make_handler(svc: Service):
                 return
             figures["gpu_policy"] = policy
             print(f"[strata] image done in {figures['seconds']:.1f} s ({policy})", flush=True)
+            host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.server.server_address[1]}"
+            scheme = "https" if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else "http"
+            self._json(200, gen.response(images, job, figures, f"{scheme}://{host}"))
+
+        def _images_edits(self):
+            gen = svc.images
+            if gen is None:
+                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
+                                           "message": "image generation is not set up on this server (run setup "
+                                                      "with --images qwen-image)"}})
+                return
+            ctype = self.headers.get("Content-Type", "")
+            raw = self._body()
+            try:
+                if ctype.startswith("multipart/form-data"):
+                    fields = images_api.parse_multipart_edits(raw, ctype)
+                    image_bytes = fields.pop("image_bytes")
+                    image_suffix = fields.pop("image_suffix")
+                    job = images_api.coerce_edit_form(fields, gen.cfg)
+                else:
+                    if not ctype.startswith("application/json"):
+                        self._json(415, {"error": {"message": "send application/json or multipart/form-data"}})
+                        return
+                    req = json.loads(raw or b"{}")
+                    if not isinstance(req, dict):
+                        raise ValueError("send a JSON object")
+                    image_bytes, image_suffix = images_api.decode_edit_image(req)
+                    job = images_api.parse_edit_request(req, gen.cfg)
+                job["image_bytes"] = image_bytes
+                job["image_suffix"] = image_suffix
+            except (images_api.ImageRequestError, ValueError, json.JSONDecodeError) as e:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                return
+            svc.last_request_at = time.time()
+            cancel = threading.Event()
+            self._watch_client(cancel)
+            print(f"[strata] image edit: {job['width']}x{job['height']}, n={job['n']}, {job['steps']} steps, "
+                  f"seed {job['seed']}", flush=True)
+            try:
+                with images_api.gpu_turn(svc, gen, job, cancel) as policy:
+                    images, figures = gen.run(job, cancel)
+            except images_api.ImageJobFailed as e:
+                self._json(500, {"error": {"type": "server_error", "code": "image_generation_failed",
+                                           "message": str(e)}})
+                return
+            figures["gpu_policy"] = policy
+            print(f"[strata] image edit done in {figures['seconds']:.1f} s ({policy})", flush=True)
             host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.server.server_address[1]}"
             scheme = "https" if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else "http"
             self._json(200, gen.response(images, job, figures, f"{scheme}://{host}"))
