@@ -5,8 +5,9 @@
 
 Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
 non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time behind a FIFO (plan: one resident sequence).
-Image generation and editing (optional, when the config has an "images" section): POST /v1/images/generations and POST /v1/images/edits (OpenAI's shape, plus seed, steps and strength) runs stable-diffusion.cpp's sd-cli for Qwen-Image-2.1-Turbo, one job at a time on the GPU the
-text engine uses (serve/images.py).
+Image generation (optional, config "images"): POST /v1/images/generations runs sd-cli for Qwen-Image-2.1-Turbo.
+Image edit (optional, config "images_edit"): POST /v1/images/edits runs sd-cli for Qwen-Image-Edit-2511 with
+--ref-image. Both share the GPU with the text engine one job at a time (serve/images.py).
 Tools from MCP servers (serve/mcp.py, `"mcp_servers"` in the config or --mcp-config) are offered only to requests that
 ask for them with `"strata_mcp": true` - the web app does; other clients see exactly the API they always saw.
 Images (optional, when the config has a "vision" entry): OpenAI image_url parts and Anthropic image blocks (base64
@@ -4963,6 +4964,7 @@ class Service:
         self.undeclared_tool_calls = "text"               # #4622: config "undeclared_tool_calls": "call" hands a call of an undeclared name to the client
         self.tool_call_recovery = True                    # default on (0.2.8): tool calls in forms next to the template's; config "tool_call_recovery": false turns it off
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
+        self.images_edit = None                           # ImageGen for "images_edit" (Qwen-Image-Edit-2511)
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = end_token_ids(tokenizer)
         self.family = None                              # the model family: set_family() below (None: the Qwen form)
@@ -5859,6 +5861,7 @@ class Service:
             "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
             "vision": {"enabled": images, "available": images, "error": None},
             "image_generation": self.images.status() if self.images is not None else {"enabled": False},
+            "image_edit_generation": self.images_edit.status() if self.images_edit is not None else {"enabled": False},
             "activity": {"requests": totals["requests"] + running,
                          "in_flight": running + int(s.get("queued") or 0),
                          "last_request_at": int(last_at) if last_at else None},
@@ -8140,10 +8143,13 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
+                                 "image_edit_generation": svc.images_edit is not None,
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path.startswith("/v1/images/files/"):
                 # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is
-                f = svc.images.file(path[len("/v1/images/files/"):]) if svc.images is not None else None
+                name = path[len("/v1/images/files/"):]
+                f = (svc.images.file(name) if svc.images is not None else None) or (
+                    svc.images_edit.file(name) if svc.images_edit is not None else None)
                 if f is None:
                     self._json(404, {"error": {"message": "not found (the server keeps the newest images only)"}})
                     return
@@ -8185,6 +8191,10 @@ def make_handler(svc: Service):
                     if svc.images is not None:            # the image model: POST /v1/images/generations
                         data.append({"id": svc.images.model, "object": "model", "status": {"value": "loaded"},
                                      "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}})
+                    if svc.images_edit is not None:       # the edit model: POST /v1/images/edits
+                        data.append({"id": svc.images_edit.model, "object": "model", "status": {"value": "loaded"},
+                                     "architecture": {"input_modalities": ["text", "image"],
+                                                      "output_modalities": ["image"]}})
                     self._json(200, {"object": "list", "data": data})
             elif path == "/props":
                 if self._authorized():
@@ -8439,11 +8449,11 @@ def make_handler(svc: Service):
             self._json(200, gen.response(images, job, figures, f"{scheme}://{host}"))
 
         def _images_edits(self):
-            gen = svc.images
+            gen = svc.images_edit
             if gen is None:
-                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
-                                           "message": "image generation is not set up on this server (run setup "
-                                                      "with --images qwen-image)"}})
+                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_edit_not_set_up",
+                                           "message": "image edit is not set up on this server "
+                                                      "(run: python tools/image/install_edit.py --config …)"}})
                 return
             ctype = self.headers.get("Content-Type", "")
             raw = self._body()
@@ -10351,11 +10361,14 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         svc.requested_slots = per_replica * len(groups) if groups else per_replica
     svc.answer_room = cfg.get("answer_room") is not False
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    def _abs_image_cfg(section: dict) -> dict:
+        keys = ("exe", "diffusion_model", "vae", "llm", "llm_vision", "out_dir")
+        return {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
+                    if k in keys and isinstance(v, str) and not os.path.isabs(v) else v)
+                for k, v in section.items()}
+
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
-        icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
-                    if k in ("exe", "diffusion_model", "vae", "llm", "out_dir") and isinstance(v, str)
-                    and not os.path.isabs(v) else v)
-                for k, v in cfg["images"].items()}
+        icfg = _abs_image_cfg(cfg["images"])
         try:
             svc.images = images_api.ImageGen(icfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None)
         except ValueError as e:
@@ -10372,6 +10385,21 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
             print(f"[strata] image generation: {vae_problem}", flush=True)
         print(f"[strata] image generation: {svc.images.model} {icfg.get('quant') or ''} on "
               f"{icfg.get('backend') or '?'} (POST /v1/images/generations; GPU policy {svc.images.policy})", flush=True)
+    if cfg.get("images_edit"):                          # image edit (Edit-2511), tools/image/install_edit.py
+        ecfg = _abs_image_cfg(cfg["images_edit"])
+        if ecfg.get("kind") is None:
+            ecfg["kind"] = "edit"
+        try:
+            log = open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None
+            svc.images_edit = images_api.ImageGen(ecfg, log=log)
+        except ValueError as e:
+            raise SystemExit(f"[strata] config: {e}")
+        gone = svc.images_edit.missing()
+        if gone:
+            print(f"[strata] image edit: missing {', '.join(gone)} - requests fail until "
+                  "tools/image/install_edit.py has run again", flush=True)
+        print(f"[strata] image edit: {svc.images_edit.model} {ecfg.get('quant') or ''} on "
+              f"{ecfg.get('backend') or '?'} (POST /v1/images/edits; GPU policy {svc.images_edit.policy})", flush=True)
     if cfg.get("prevent_sleep") is not None and not isinstance(cfg["prevent_sleep"], bool):
         raise SystemExit(f"[strata] config \"prevent_sleep\" must be true or false, not {cfg['prevent_sleep']!r}")
     from serve.keepawake import KeepAwake

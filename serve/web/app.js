@@ -121,8 +121,9 @@ async function loadHealth() {
     health = await (await fetch("health")).json();
     renderEmptyChat();
     $("tab-btn-images").hidden = !health.image_generation;
-    $("tab-btn-images-edit").hidden = !health.image_generation;
-    if ((location.hash === "#images" || location.hash === "#images-edit") && health.image_generation) showTab(location.hash.slice(1));
+    $("tab-btn-images-edit").hidden = !health.image_edit_generation;
+    if (location.hash === "#images" && health.image_generation) showTab("images");
+    if (location.hash === "#images-edit" && health.image_edit_generation) showTab("images-edit");
   } catch (e) {
     setTimeout(loadHealth, 2000);
   }
@@ -1653,8 +1654,6 @@ $("imge-form").onsubmit = async (ev) => {
   form.append("size", $("imge-size").value);
   form.append("response_format", "b64_json");
   if ($("imge-seed").value !== "") form.append("seed", $("imge-seed").value);
-  const strength = $("imge-strength").value;
-  if (strength !== "") form.append("strength", strength);
   imageBusy = true;
   $("imge-go").disabled = true;
   paintLive();
@@ -1664,16 +1663,13 @@ $("imge-form").onsubmit = async (ev) => {
     const r = await fetch("v1/images/edits", {method: "POST", headers: headers(false), body: form});
     const j = await r.json();
     if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
-    const capStrength = (j.strata && j.strata.strength != null)
-      ? j.strata.strength
-      : (strength !== "" ? strength : 0.75);
     for (const d of j.data) {
       const fig = document.createElement("figure");
       const img = document.createElement("img");
       img.src = "data:image/png;base64," + d.b64_json;
       img.alt = prompt;
       const cap = document.createElement("figcaption");
-      cap.textContent = `${j.size}, seed ${d.seed}, strength ${capStrength}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
+      cap.textContent = `${j.size}, seed ${d.seed}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
       fig.append(img, cap);
       $("imge-results").prepend(fig);
     }

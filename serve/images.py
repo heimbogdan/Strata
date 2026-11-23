@@ -1,8 +1,9 @@
-"""serve/images.py - image generation (Qwen-Image-2.1-Turbo) through stable-diffusion.cpp's sd-cli.
+"""serve/images.py - image generation (Qwen-Image-2.1-Turbo) and edit (Qwen-Image-Edit-2511) through sd-cli.
 
-POST /v1/images/generations and POST /v1/images/edits take OpenAI's request shape (prompt, size, n, response_format b64_json|url, background, strength for edits)
-plus Strata's own fields seed and steps.  Each request runs one `sd-cli` process with the arguments the model's card
-gives for stable-diffusion.cpp (8 steps, CFG 1, euler, Turbo's sigmas, --diffusion-fa).  The model writes RGBA; by
+POST /v1/images/generations uses the config's "images" section (Turbo: 8 steps, CFG 1, euler, Turbo's sigmas).
+POST /v1/images/edits uses "images_edit" (Edit-2511: 20 steps, CFG 2.5, --ref-image, --llm_vision,
+qwen_image_zero_cond_t). Both take OpenAI's request shape (prompt, size, n, response_format b64_json|url,
+background) plus Strata's seed and steps.  Each request runs one `sd-cli` process.  The model writes RGBA; by
 default each picture is put on white and returned as an 8-bit RGB PNG with sd-cli's other chunks (its "parameters"
 text) unchanged (flatten_png); background "transparent" returns the PNG exactly as sd-cli wrote it.
 
@@ -28,6 +29,10 @@ The config's "images" section (written by setup --images, tools/image/install.py
    operating system and CPU, built into sd-cli by setup --image-noise on.  "vae_decoder": "sdcpp" (default) is
    stable-diffusion.cpp's VAE decoder; "strata" is Strata's own, src/image/vae via tools/image/sdcpp_vae, CUDA / HIP
    builds only, built into sd-cli by setup --image-vae on)
+
+The config's "images_edit" section (tools/image/install_edit.py) is the same shape plus
+  "kind": "edit", "llm_vision": "...mmproj-F16.gguf", "cfg_scale": 2.5, "steps": 20,
+  "model_args": ["qwen_image_zero_cond_t=true"], "args": ["--diffusion-fa", "--flow-shift", "3"]
 """
 from __future__ import annotations
 
@@ -71,13 +76,14 @@ VAE_BACKEND = ("Image generation is set to use Strata's own picture decoder (\"v
                "for {backend}. Set \"vae_decoder\" to \"sdcpp\" in the images settings.")   # {backend}: as setup prints it
 SIZE_STEP = 32                     # sd.cpp's Qwen-Image-2.1 docs: dimensions divisible by 32
 MIN_SIDE = 256
-DEFAULT_STRENGTH = 0.75
 # Cap decoded edit images (~MCP media); independent of HTTP body_limit().
 MAX_EDIT_IMAGE_BYTES = 25_000_000
 _EDIT_IMAGE_TYPES = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/webp": ".webp"}
-_EDIT_FORM_NUMERIC = ("strength", "n", "seed", "steps")
+_EDIT_FORM_NUMERIC = ("n", "seed", "steps")
 FILE_NAME = re.compile(r"^[0-9a-f]{32}\.png$")
 STEP_LINE = re.compile(r"\|\s*(\d+)/(\d+)\s*-")      # sd.cpp's progress bar: "|====    | 3/8 - 14.1s/it"
+EDIT_STEPS = 20
+EDIT_CFG = 2.5
 
 
 class ImageRequestError(ValueError):
@@ -136,7 +142,8 @@ def parse_request(req: dict, cfg: dict) -> dict:
         raise ImageRequestError("background: transparent, opaque or auto")
     w, h = parse_size(req.get("size"), int(cfg.get("max_side") or 2048))
     n = _int_field(req, "n", 1, int(cfg.get("max_n") or 4), 1)
-    steps = _int_field(req, "steps", 1, 100, int(cfg.get("steps") or TURBO_STEPS))
+    default_steps = int(cfg.get("steps") or (EDIT_STEPS if cfg.get("kind") == "edit" else TURBO_STEPS))
+    steps = _int_field(req, "steps", 1, 100, default_steps)
     seed = _int_field(req, "seed", 0, 2**62, None)
     if seed is None:
         seed = random.SystemRandom().randrange(0, 2**31)
@@ -144,18 +151,9 @@ def parse_request(req: dict, cfg: dict) -> dict:
             "background": background}
 
 
-def parse_strength(value) -> float:
-    if value is None:
-        return DEFAULT_STRENGTH
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not (0.0 <= float(value) <= 1.0):
-        raise ImageRequestError("strength: a number from 0 to 1")
-    return float(value)
-
-
 def parse_edit_request(req: dict, cfg: dict) -> dict:
-    job = parse_request(req, cfg)
-    job["strength"] = parse_strength(req.get("strength"))
-    return job
+    """Edit fields; strength is ignored (Edit-2511 is instruction edit via --ref-image, not classic img2img)."""
+    return parse_request(req, cfg)
 
 
 def decode_data_url(url: str) -> tuple[bytes, str]:
@@ -252,7 +250,7 @@ def coerce_edit_form(fields: dict, cfg: dict) -> dict:
     req = {k: v for k, v in fields.items() if k not in ("image_bytes", "image_suffix")}
     for key in _EDIT_FORM_NUMERIC:
         if key in req and isinstance(req[key], str):
-            req[key] = float(req[key]) if key == "strength" else int(req[key])
+            req[key] = int(req[key])
     job = parse_edit_request(req, cfg)
     if image_bytes is not None:
         job["image_bytes"] = image_bytes
@@ -281,24 +279,27 @@ def write_init_image(work: Path, data: bytes, suffix: str = ".png") -> Path:
 
 
 def sd_cli_args(cfg: dict, job: dict, out_pattern: str, prompt_file: str) -> list[str]:
-    """The sd-cli command for one job: the model card's stable-diffusion.cpp command (8 steps, CFG 1, euler, Turbo's
-    sigmas, --diffusion-fa from the config's args), the prompt from `prompt_file` (write_prompt), the size, seed and
-    batch count, and the config's other args."""
+    """The sd-cli command for one job.  Turbo (default): 8 steps, CFG 1, euler, Turbo's sigmas.
+    Edit-2511 (cfg kind \"edit\"): CFG from cfg (2.5), --ref-image, --llm_vision, model_args from the config."""
+    edit = cfg.get("kind") == "edit"
+    cfg_scale = cfg.get("cfg_scale", EDIT_CFG) if edit else 1.0
     cmd = [str(cfg["exe"]),
            "--diffusion-model", str(cfg["diffusion_model"]), "--vae", str(cfg["vae"]), "--llm", str(cfg["llm"]),
            "--prompt-file", prompt_file,
-           "--steps", str(job["steps"]), "--cfg-scale", "1.0", "--sampling-method", "euler",
+           "--steps", str(job["steps"]), "--cfg-scale", str(cfg_scale), "--sampling-method", "euler",
            "-W", str(job["width"]), "-H", str(job["height"])]
-    if job["steps"] == TURBO_STEPS:
+    if edit and cfg.get("llm_vision"):
+        cmd += ["--llm_vision", str(cfg["llm_vision"])]
+    if not edit and job["steps"] == TURBO_STEPS:
         cmd += ["--sigmas", str(cfg.get("sigmas") or TURBO_SIGMAS)]
     cmd += ["-s", str(job["seed"])]
     if job["n"] > 1:
         cmd += ["-b", str(job["n"])]
-    if job.get("init_img"):
-        cmd += ["--init-img", str(job["init_img"]), "--strength", str(job.get("strength", DEFAULT_STRENGTH))]
+    if edit and job.get("ref_img"):
+        cmd += ["--ref-image", str(job["ref_img"])]
     cmd += ["-o", out_pattern]
     cmd += [str(a) for a in (cfg.get("args") or [])]
-    model_args = []
+    model_args = [str(a) for a in (cfg.get("model_args") or [])]
     if cfg.get("native") is True:                   # Strata's DiT runner inside sd-cli (CUDA / HIP builds)
         model_args.append("qwen_image_2_1_native=1")
     if cfg.get("noise") == "strata":                # Strata's noise generator inside sd-cli (tools/image/sdcpp_noise)
@@ -476,13 +477,14 @@ def log_figures(log: str) -> dict:
 
 
 def need_mib(cfg: dict, width: int, height: int) -> int:
-    """The GPU memory an image job is planned with: the three model files plus the working buffers (about 2 GiB plus
+    """The GPU memory an image job is planned with: the model files plus the working buffers (about 2 GiB plus
     4 GiB per megapixel at Turbo's settings; the 780M baseline peaked 7.4 GB over the weights at 1024x1024 on HIP);
     the config's "need_mib" overrides it."""
     if cfg.get("need_mib"):
         return int(cfg["need_mib"])
     files = 0
-    for k in ("diffusion_model", "vae", "llm"):
+    keys = ("diffusion_model", "vae", "llm", "llm_vision") if cfg.get("llm_vision") else ("diffusion_model", "vae", "llm")
+    for k in keys:
         try:
             files += Path(cfg[k]).stat().st_size
         except (OSError, KeyError, TypeError):
@@ -496,25 +498,33 @@ class ImageGen:
 
     def __init__(self, cfg: dict, log=None):
         self.cfg = dict(cfg)
+        section = "images_edit" if self.cfg.get("kind") == "edit" else "images"
         policy = self.cfg.get("gpu_policy") or "auto"
         if policy not in POLICIES:
-            raise ValueError(f'images "gpu_policy" must be one of {", ".join(POLICIES)}, not {policy!r}')
+            raise ValueError(f'{section} "gpu_policy" must be one of {", ".join(POLICIES)}, not {policy!r}')
         reload = self.cfg.get("reload") or "lazy"
         if reload not in ("lazy", "eager"):
-            raise ValueError(f'images "reload" must be lazy or eager, not {reload!r}')
-        for k in ("exe", "diffusion_model", "vae", "llm"):
+            raise ValueError(f'{section} "reload" must be lazy or eager, not {reload!r}')
+        needed = ("exe", "diffusion_model", "vae", "llm")
+        if self.cfg.get("kind") == "edit":
+            needed = (*needed, "llm_vision")
+        for k in needed:
             if not isinstance(self.cfg.get(k), str) or not self.cfg[k]:
-                raise ValueError(f'the config\'s "images" section needs "{k}" (run setup with --images again)')
+                hint = ("run tools/image/install_edit.py" if section == "images_edit"
+                        else "run setup with --images again")
+                raise ValueError(f'the config\'s "{section}" section needs "{k}" ({hint})')
         if self.cfg.get("noise", "sdcpp") not in NOISES:
-            raise ValueError(f'images "noise" must be one of {", ".join(NOISES)}, not {self.cfg["noise"]!r}')
+            raise ValueError(f'{section} "noise" must be one of {", ".join(NOISES)}, not {self.cfg["noise"]!r}')
         if self.cfg.get("vae_decoder", "sdcpp") not in VAE_DECODERS:
-            raise ValueError(f'images "vae_decoder" must be one of {", ".join(VAE_DECODERS)}, '
+            raise ValueError(f'{section} "vae_decoder" must be one of {", ".join(VAE_DECODERS)}, '
                              f'not {self.cfg["vae_decoder"]!r}')
         self.policy, self.reload = policy, reload
-        self.model = self.cfg.get("model_name") or MODEL_NAME
+        self.model = self.cfg.get("model_name") or ("qwen-image-edit-2511" if self.cfg.get("kind") == "edit"
+                                                    else MODEL_NAME)
         self.log = log
         out = self.cfg.get("out_dir")
-        self.dir = Path(out) if out else Path(tempfile.mkdtemp(prefix="strata-images-"))
+        prefix = "strata-images-edit-" if self.cfg.get("kind") == "edit" else "strata-images-"
+        self.dir = Path(out) if out else Path(tempfile.mkdtemp(prefix=prefix))
         self.dir.mkdir(parents=True, exist_ok=True)
         self.keep_files = int(self.cfg.get("keep_files") or 64)
         self.lock = threading.Lock()              # one sd-cli at a time even when the service's turn is not taken
@@ -523,7 +533,10 @@ class ImageGen:
         self.progress = None                       # (step, steps) of the running job
 
     def missing(self) -> list[str]:
-        return [self.cfg[k] for k in ("exe", "diffusion_model", "vae", "llm") if not Path(self.cfg[k]).exists()]
+        keys = ["exe", "diffusion_model", "vae", "llm"]
+        if self.cfg.get("llm_vision"):
+            keys.append("llm_vision")
+        return [self.cfg[k] for k in keys if not Path(self.cfg[k]).exists()]
 
     def noise_problem(self) -> str | None:
         """NOISE_MISSING when the config says "noise": "strata" and the sd-cli it runs was not built with Strata's noise
@@ -587,8 +600,8 @@ class ImageGen:
         job = dict(job)
         try:
             if job.get("image_bytes"):
-                init_path = write_init_image(work, job["image_bytes"], job.get("image_suffix") or ".png")
-                job["init_img"] = str(init_path)
+                ref_path = write_init_image(work, job["image_bytes"], job.get("image_suffix") or ".png")
+                job["ref_img"] = str(ref_path)
             cmd = sd_cli_args(self.cfg, job, pattern, str(write_prompt(work, job["prompt"])))
         except BaseException:                       # the prompt file was not made: nothing else is in the folder yet
             for p in work.iterdir():
@@ -654,8 +667,6 @@ class ImageGen:
         figures = {"seconds": round(secs, 2), "steps": job["steps"], "n": job["n"],
                    "size": f"{job['width']}x{job['height']}", "seed": job["seed"],
                    "backend": self.cfg.get("backend"), "quant": self.cfg.get("quant")}
-        if "strength" in job:
-            figures["strength"] = job["strength"]
         figures.update(log_figures(log))
         if job.get("background", "auto") != "transparent":
             t1 = time.monotonic()

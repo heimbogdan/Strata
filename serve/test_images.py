@@ -40,6 +40,18 @@ def image_cfg(d, **kw):
             "out_dir": str(Path(d) / "out"), **files, **kw}
 
 
+def edit_cfg(d, **kw):
+    """images_edit section for Edit-2511 tests."""
+    files = {}
+    for k in ("diffusion_model", "vae", "llm", "llm_vision"):
+        p = Path(d) / f"{k}.bin"
+        p.write_bytes(b"x" * 1024)
+        files[k] = str(p)
+    return {"kind": "edit", "model_name": "qwen-image-edit-2511", "exe": str(FAKE), "backend": "vulkan",
+            "quant": "Q4_K_M", "args": ["--diffusion-fa", "--flow-shift", "3"], "cfg_scale": 2.5, "steps": 20,
+            "model_args": ["qwen_image_zero_cond_t=true"], "out_dir": str(Path(d) / "out-edit"), **files, **kw}
+
+
 class Request(unittest.TestCase):
     CFG = {"max_n": 4, "max_side": 2048}
 
@@ -68,20 +80,18 @@ class Request(unittest.TestCase):
 
 
 class EditRequest(unittest.TestCase):
-    CFG = {"max_n": 4, "max_side": 2048}
+    CFG = {"kind": "edit", "steps": 20, "max_n": 4, "max_side": 2048}
 
-    def test_defaults_include_strength(self):
+    def test_defaults_use_edit_steps(self):
         j = images_api.parse_edit_request({"prompt": "a cat"}, self.CFG)
-        self.assertEqual(j["strength"], 0.75)
-        self.assertEqual((j["width"], j["height"], j["n"], j["steps"]), (1024, 1024, 1, 8))
+        self.assertNotIn("strength", j)
+        self.assertEqual((j["width"], j["height"], j["n"], j["steps"]), (1024, 1024, 1, 20))
 
-    def test_strength_ok_and_refused(self):
-        self.assertEqual(images_api.parse_edit_request({"prompt": "x", "strength": 0.4}, self.CFG)["strength"], 0.4)
-        self.assertEqual(images_api.parse_edit_request({"prompt": "x", "strength": 0}, self.CFG)["strength"], 0.0)
-        self.assertEqual(images_api.parse_edit_request({"prompt": "x", "strength": 1}, self.CFG)["strength"], 1.0)
-        for bad in (True, "0.5", -0.1, 1.1, 2):
-            with self.subTest(bad=bad), self.assertRaises(images_api.ImageRequestError):
-                images_api.parse_edit_request({"prompt": "x", "strength": bad}, self.CFG)
+    def test_strength_ignored(self):
+        j = images_api.parse_edit_request({"prompt": "x", "strength": 0.4}, self.CFG)
+        self.assertNotIn("strength", j)
+        j2 = images_api.parse_edit_request({"prompt": "x", "strength": "nope"}, self.CFG)
+        self.assertNotIn("strength", j2)
 
 
 class EditImageDecode(unittest.TestCase):
@@ -133,55 +143,68 @@ class EditImageDecode(unittest.TestCase):
             if isinstance(value, str):
                 value = value.encode()
             return head.encode() + value + b"\r\n"
-        body = (part("prompt", "make it blue") + part("strength", "0.4")
+        body = (part("prompt", "make it blue") + part("seed", "7")
                 + part("image", png, filename="in.png", ctype="image/png")
                 + f"--{boundary}--\r\n".encode())
         req = images_api.parse_multipart_edits(body, f"multipart/form-data; boundary={boundary}")
         self.assertEqual(req["prompt"], "make it blue")
-        self.assertEqual(req["strength"], "0.4")
+        self.assertEqual(req["seed"], "7")
         self.assertEqual(req["image_bytes"], png)
         self.assertEqual(req["image_suffix"], ".png")
 
     def test_coerce_edit_form(self):
-        fields = {"prompt": "x", "strength": "0.4", "seed": "7", "image_bytes": b"\x89PNG", "image_suffix": ".png"}
-        job = images_api.coerce_edit_form(fields, {"max_n": 4, "max_side": 2048})
-        self.assertEqual(job["strength"], 0.4)
+        fields = {"prompt": "x", "seed": "7", "image_bytes": b"\x89PNG", "image_suffix": ".png"}
+        job = images_api.coerce_edit_form(fields, {"kind": "edit", "steps": 20, "max_n": 4, "max_side": 2048})
+        self.assertNotIn("strength", job)
         self.assertEqual(job["seed"], 7)
+        self.assertEqual(job["steps"], 20)
         self.assertEqual(job["image_bytes"], b"\x89PNG")
         self.assertEqual(job["image_suffix"], ".png")
 
 
 class EditRun(unittest.TestCase):
-    def test_run_writes_init_and_records_strength(self):
+    def test_run_writes_ref_image(self):
         with tempfile.TemporaryDirectory() as d:
-            gen = images_api.ImageGen(image_cfg(d))
+            gen = images_api.ImageGen(edit_cfg(d))
             args_path = Path(d) / "args.json"
-            job = images_api.parse_edit_request({"prompt": "x", "seed": 1, "size": "512x512", "strength": 0.4},
-                                                  {"max_n": 4, "max_side": 2048})
+            job = images_api.parse_edit_request({"prompt": "x", "seed": 1, "size": "512x512"},
+                                                  {"kind": "edit", "steps": 20, "max_n": 4, "max_side": 2048})
             job["image_bytes"] = b"\x89PNG\r\n\x1a\nxx"
             job["image_suffix"] = ".png"
             with mock.patch.dict(os.environ, {"FAKE_SD_ARGS": str(args_path)}):
                 with mock.patch.object(images_api, "sd_cli_args", fake_args):
                     images, figures = gen.run(job)
-            self.assertEqual(figures["strength"], 0.4)
+            self.assertNotIn("strength", figures)
+            self.assertEqual(figures["steps"], 20)
             argv = json.loads(args_path.read_text(encoding="utf-8"))
-            self.assertIn("--init-img", argv)
-            self.assertEqual(argv[argv.index("--strength") + 1], "0.4")
+            self.assertIn("--ref-image", argv)
+            self.assertNotIn("--init-img", argv)
+            self.assertNotIn("--strength", argv)
             self.assertEqual(len(images), 1)
             self.assertEqual(list(Path(gen.dir).glob("job-*")), [])   # work dir cleaned up
 
 
 class EditCommand(unittest.TestCase):
-    def test_init_img_and_strength_on_command(self):
-        cfg = {"exe": "sd-cli", "diffusion_model": "d", "vae": "v", "llm": "l", "args": ["--diffusion-fa"]}
-        job = {"prompt": "p", "width": 512, "height": 512, "n": 1, "steps": 8, "seed": 1,
-               "strength": 0.4, "init_img": "work/init.png"}
+    def test_ref_image_and_edit_flags(self):
+        cfg = {"kind": "edit", "exe": "sd-cli", "diffusion_model": "d", "vae": "v", "llm": "l",
+               "llm_vision": "mmproj.bin", "cfg_scale": 2.5, "args": ["--diffusion-fa", "--flow-shift", "3"],
+               "model_args": ["qwen_image_zero_cond_t=true"]}
+        job = {"prompt": "p", "width": 512, "height": 512, "n": 1, "steps": 20, "seed": 1,
+               "ref_img": "work/init.png"}
         cmd = images_api.sd_cli_args(cfg, job, "x", "p.txt")
-        self.assertEqual(cmd[cmd.index("--init-img") + 1], "work/init.png")
-        self.assertEqual(cmd[cmd.index("--strength") + 1], "0.4")
-        # generations (no init_img) unchanged:
-        job2 = {k: v for k, v in job.items() if k not in ("init_img", "strength")}
-        self.assertNotIn("--init-img", images_api.sd_cli_args(cfg, job2, "x", "p.txt"))
+        self.assertEqual(cmd[cmd.index("--ref-image") + 1], "work/init.png")
+        self.assertEqual(cmd[cmd.index("--llm_vision") + 1], "mmproj.bin")
+        self.assertEqual(cmd[cmd.index("--cfg-scale") + 1], "2.5")
+        self.assertIn("qwen_image_zero_cond_t=true", cmd[cmd.index("--model-args") + 1])
+        self.assertNotIn("--init-img", cmd)
+        self.assertNotIn("--strength", cmd)
+        self.assertNotIn("--sigmas", cmd)
+        # generations (Turbo) unchanged:
+        cfg2 = {"exe": "sd-cli", "diffusion_model": "d", "vae": "v", "llm": "l", "args": ["--diffusion-fa"]}
+        job2 = {"prompt": "p", "width": 512, "height": 512, "n": 1, "steps": 8, "seed": 1}
+        cmd2 = images_api.sd_cli_args(cfg2, job2, "x", "p.txt")
+        self.assertNotIn("--ref-image", cmd2)
+        self.assertIn("--sigmas", cmd2)
 
 
 class Command(unittest.TestCase):
@@ -559,6 +582,7 @@ class OverHttp(unittest.TestCase):
         self.engine = MockEngine(tok, "</think>\n\nok")
         self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         self.svc.images = images_api.ImageGen(image_cfg(self.tmp.name, keep_files=3))
+        self.svc.images_edit = images_api.ImageGen(edit_cfg(self.tmp.name, keep_files=3))
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 
@@ -677,7 +701,11 @@ class OverHttp(unittest.TestCase):
         self.assertIn("qwen-image-2.1-turbo", ids)
         st = json.loads(self.get("/v1/status")[1])
         self.assertTrue(st["image_generation"]["enabled"])
-        self.assertTrue(json.loads(self.get("/health")[1])["image_generation"])
+        self.assertTrue(st["image_edit_generation"]["enabled"])
+        health = json.loads(self.get("/health")[1])
+        self.assertTrue(health["image_generation"])
+        self.assertTrue(health["image_edit_generation"])
+        self.assertIn("qwen-image-edit-2511", ids)
 
     def test_not_set_up(self):
         self.svc.images = None
@@ -732,12 +760,12 @@ class OverHttp(unittest.TestCase):
             "prompt": "a green cat",
             "seed": 11,
             "images": [{"image_url": url}],
-            "strength": 0.5,
         })
         self.assertEqual(code, 200, body)
         self.assertEqual(len(body["data"]), 1)
-        self.assertEqual(body["strata"]["steps"], 8)
-        self.assertEqual(body["strata"]["strength"], 0.5)
+        self.assertEqual(body["model"], "qwen-image-edit-2511")
+        self.assertEqual(body["strata"]["steps"], 20)
+        self.assertNotIn("strength", body["strata"])
 
     def test_edits_multipart(self):
         boundary = "----strataedit"
@@ -753,21 +781,22 @@ class OverHttp(unittest.TestCase):
             if isinstance(value, str):
                 value = value.encode()
             return head.encode() + value + b"\r\n"
-        
-        body = (part("prompt", "make it blue") + part("strength", "0.4")
+
+        body = (part("prompt", "make it blue") + part("seed", "3")
                 + part("image", png, filename="in.png", ctype="image/png")
                 + f"--{boundary}--\r\n".encode())
-        
+
         code, body = self.post_edits(body, is_multipart=True, boundary=boundary)
         self.assertEqual(code, 200, body)
         self.assertEqual(len(body["data"]), 1)
-        self.assertEqual(body["strata"]["strength"], 0.4)
+        self.assertEqual(body["strata"]["steps"], 20)
+        self.assertNotIn("strength", body["strata"])
 
     def test_edits_not_set_up(self):
-        self.svc.images = None
+        self.svc.images_edit = None
         code, body = self.post_edits({"prompt": "x"})
         self.assertEqual(code, 404)
-        self.assertEqual(body["error"]["code"], "images_not_set_up")
+        self.assertEqual(body["error"]["code"], "images_edit_not_set_up")
 
     def test_edits_missing_image_400(self):
         code, body = self.post_edits({"prompt": "x"})
